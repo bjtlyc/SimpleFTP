@@ -6,15 +6,17 @@
 import java.util.*;
 import java.net.*;
 import java.io.*;
+import java.util.concurrent.*;
 public class Client
 {
-    private Segement [] buffer;//local buffer used in the sliding window protocol, used as window 
+    private Segment [] buffer;//local buffer used in the sliding window protocol, used as window 
     private Timer [] timer;
     private int bufSize;
     private String hostName;//host name 
+    private InetAddress serverIp;
     private int serverPort;//port number of the server
     private DatagramSocket socket = null; 
-    private fileName;//name of the file to be transfered
+    private String fileName;//name of the file to be transfered
     private int N;  //window size
     private int MSS;//maximum segment size
     private int winHead;//pointer to the head of the window
@@ -36,10 +38,16 @@ public class Client
         this.N = N;
         this.MSS = MSS;
         this.bufSize = N;
-        buffer = new Segment[bufSize];
-        timer = new Timer[bufSize];
-        socket = new DatagramSocket(serverPort, hostName);
-        segSize = MSS + headerLen;
+        this.segSize = MSS + headerLen;
+        this.buffer = new Segment[bufSize];
+        this.timer = new Timer[bufSize];
+        try{
+            this.serverIp = InetAddress.getByName(hostName);
+            this.socket = new DatagramSocket(serverPort, serverIp);
+        }catch(Exception e)
+        {
+            e.printStackTrace();
+        }
     }
     /*
      * Initiliaze the buffer
@@ -56,16 +64,22 @@ public class Client
     public void start()
     {
         initBuf();
-        SlidingWindow sw = new SlidingWindow(socket, buffer, mutex, empty, item, segSize);
+        SlidingWindow sw = new SlidingWindow();
         sw.start();
 
         try(FileInputStream fio = new FileInputStream(fileName))
         {
-            byte [] temp = new byte[MSS];
-            while( read(temp) != -1 )
+            byte [] temp = new byte[MSS+headerLen];
+            int seqno = 0;
+            int num = 0;
+            while( (num = fio.read(temp, headerLen, MSS)) != -1 )
             {
-                send(new Segment(temp));
+                send(new Segment(seqno, num, temp));
+                seqno = seqno + num;
             }
+        }catch(IOException e)
+        {
+            e.printStackTrace();
         }
 
     }
@@ -75,24 +89,29 @@ public class Client
      */
     public void send(Segment seg)
     {
-        empty.acquire();
-        mutex.acquire();
-        buffer[bufTail] = seg;
+        try
+        {
+            empty.acquire();
+            mutex.acquire();
+            buffer[bufTail] = seg;
 
-        //send the segment to the server
-        InetAddress address = InetAddress.getByName(hostName);
-        DatagramPacket packet = new DatagramPacket(seg.seg, seg.seg.length, address, portNum);
-        socket.send(packet);
+            //send the segment to the server
+            DatagramPacket packet = new DatagramPacket(seg.get(), seg.size(), serverIp, serverPort);
+            socket.send(packet);
 
-        //Start the retransmision timer
-        RetransTimer t = new RetransTimer(bufTail);
-        timer[bufTail].schedule(t, 200);
-
-        bufTail = (bufTail + 1) % bufSize;
+            //Start the retransmision timer
+            RetransTimer t = new RetransTimer(bufTail);
+            timer[bufTail].schedule(t, 200);
+            bufTail = (bufTail + 1) % bufSize;
         
-        mutex.release();
-        full.release();
+            mutex.release();
+            item.release();
+        }catch(Exception e)
+        {
+            e.printStackTrace();
+        }
     }
+
 
     public static void main(String args[])
     {
@@ -101,29 +120,15 @@ public class Client
             System.err.println("Invalid Parameter");
             System.exit(1);
         }
-        Client c = new Client(args[0], args[1], args[2], args[3], args[4]);
+        Client c = new Client(args[0], Integer.valueOf(args[1]), args[2], Integer.valueOf(args[3]), Integer.valueOf(args[4]));
         c.start();
 
     }
 
     /*
-     * Data structure for segment
-     */
-    public static class Segment
-    {
-        public int seqno;
-        public short checksum;
-        public Status status;
-        public [] byte seg;
-        public Segment(byte[] seg)
-        {
-            this.seg = seg;
-        }
-    }
-    /*
      * Timer task
      */
-    public static class RetransTimer extends TimerTask
+    public class RetransTimer extends TimerTask
     {
         private int index;
         public RetransTimer(int index)
@@ -136,7 +141,76 @@ public class Client
         @Override
         public void run()
         {
-            
+            try{
+                //send the segment to the server
+                DatagramPacket packet = new DatagramPacket(buffer[index].get(), buffer[index].size(), serverIp, serverPort);
+                socket.send(packet);
+    
+                //Start the retransmision timer
+                timer[bufTail].schedule(new RetransTimer(index), 200);
+            }catch(IOException e)
+            {
+                e.printStackTrace();
+            }
         }
     }
+
+    /*
+     * Class to handle sliding window
+     */
+    public class SlidingWindow extends Thread
+    {
+        private boolean running = true;
+        public SlidingWindow()
+        {
+            super();
+        }
+        /* Receive datagram from server, if ack, advance window. 
+         * Whenever send a byte, start a timer for it. If overdue, resend the byte
+         */
+        @Override
+        public void run()
+        {
+            while(running)
+            {
+                try
+                {
+                    byte[] buf = new byte[segSize];
+                    // receive segments from server 
+                    DatagramPacket packet = new DatagramPacket(buf, buf.length);
+                    socket.receive(packet);
+                    // construct the segment and process it 
+                    Segment seg = new Segment(packet.getData(), packet.getLength());
+                    if(seg.type() == 1)
+                    {
+                        if(seg.getSeqNo() == buffer[bufHead].getSeqNo() + buffer[bufHead].size())
+                            consume(seg);
+                        else if(seg.getSeqNo() == buffer[bufHead].getSeqNo())
+                            ;//retransmit
+                    }
+                }catch(IOException e)
+                {
+                    e.printStackTrace();
+                }
+            }
+        }
+
+        public void consume(Segment seg)
+        {
+            try{
+                item.acquire();
+                mutex.acquire();
+    
+                //set the status, if the head of the buffer, remove, cancel the timer, else do nothing
+                timer[bufHead].cancel();
+                bufHead = (bufHead + 1) % bufSize;
+        
+                mutex.release();
+                empty.release();
+            }catch(Exception e)
+            {
+                e.printStackTrace();
+            }
+        }
+        }
 }
