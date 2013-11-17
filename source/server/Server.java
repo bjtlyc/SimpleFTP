@@ -1,4 +1,5 @@
-public class Server
+import java.util.*;
+public class Server extends Thread
 {
     private int serverPort;// port number of the server
     private String fileName;//name of the file will be written
@@ -16,6 +17,7 @@ public class Server
      * this packets is good or bad, if good, send back a ACK; if bad, drop it. Maintain the 
      * sliding window.
      */
+    @Override
     public void run()
     {
         socket = new DatagramSocket(serverPort);
@@ -33,6 +35,6 @@ public class Server
             System.exit(1);
         }
         Server s = new Server(args[0], args[1], args[2]);
-        s.run();
+        s.start();
     }
 }
