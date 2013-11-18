@@ -26,9 +26,9 @@ public class Client
     private int bufTail;// pointer to the tail of the buffer
     private int headerLen = 8;// length of the header(in byte)
     private int segSize;
-    private Semaphore mutex = new Semaphore(1);
-    private Semaphore empty = new Semaphore(bufSize);
-    private Semaphore item = new Semaphore(0);
+    private Semaphore mutex;
+    private Semaphore empty;
+    private Semaphore item;
 
     public Client(String hostName, int serverPort, String fileName, int N, int MSS)
     {
@@ -41,9 +41,12 @@ public class Client
         this.segSize = MSS + headerLen;
         this.buffer = new Segment[bufSize];
         this.timer = new Timer[bufSize];
+        this.mutex = new Semaphore(1);
+        this.empty = new Semaphore(bufSize);
+        this.item = new Semaphore(0);
         try{
             this.serverIp = InetAddress.getByName(hostName);
-            this.socket = new DatagramSocket(serverPort, serverIp);
+            this.socket = new DatagramSocket();
         }catch(Exception e)
         {
             e.printStackTrace();
@@ -74,8 +77,10 @@ public class Client
             int num = 0;
             while( (num = fio.read(temp, headerLen, MSS)) != -1 )
             {
+                //System.out.println(new String(temp, 0, num));
                 send(new Segment(seqno, num, temp));
                 seqno = seqno + num;
+                Arrays.fill(temp, (byte)0);
             }
         }catch(IOException e)
         {
@@ -89,18 +94,26 @@ public class Client
      */
     public void send(Segment seg)
     {
+        Segment temp = new Segment(seg.get(), seg.size());
+        System.out.println(temp.getSeqNo());
         try
         {
+            //System.out.println(bufSize);
+            //System.out.println(empty.availablePermits());
             empty.acquire();
             mutex.acquire();
             buffer[bufTail] = seg;
 
+            //System.out.println(seg.getSeqNo());
             //send the segment to the server
             DatagramPacket packet = new DatagramPacket(seg.get(), seg.size(), serverIp, serverPort);
             socket.send(packet);
 
+            //System.out.println(new String(seg.get(),0,seg.size()));
+
             //Start the retransmision timer
             RetransTimer t = new RetransTimer(bufTail);
+            timer[bufTail] = new Timer();
             timer[bufTail].schedule(t, 200);
             bufTail = (bufTail + 1) % bufSize;
         
@@ -141,13 +154,14 @@ public class Client
         @Override
         public void run()
         {
+            System.out.println("Timeout, sequence number = "+buffer[index].getSeqNo());
             try{
                 //send the segment to the server
                 DatagramPacket packet = new DatagramPacket(buffer[index].get(), buffer[index].size(), serverIp, serverPort);
                 socket.send(packet);
     
                 //Start the retransmision timer
-                timer[bufTail].schedule(new RetransTimer(index), 200);
+                timer[index].schedule(new RetransTimer(index), 200);
             }catch(IOException e)
             {
                 e.printStackTrace();
@@ -181,9 +195,13 @@ public class Client
                     socket.receive(packet);
                     // construct the segment and process it 
                     Segment seg = new Segment(packet.getData(), packet.getLength());
+
+                    System.out.println("Receive segment no: "+seg.getSeqNo()+"seg type: "+seg.type());
+
+                    //System.out.println(Arrays.toString(seg.get()));
                     if(seg.type() == 1)
                     {
-                        if(seg.getSeqNo() == buffer[bufHead].getSeqNo() + buffer[bufHead].size())
+                        if(seg.getSeqNo() == buffer[bufHead].getSeqNo() + buffer[bufHead].getDataSize())
                             consume(seg);
                         else if(seg.getSeqNo() == buffer[bufHead].getSeqNo())
                             ;//retransmit
@@ -198,6 +216,7 @@ public class Client
         public void consume(Segment seg)
         {
             try{
+                System.out.println("consume");
                 item.acquire();
                 mutex.acquire();
     
